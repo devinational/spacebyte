@@ -42,7 +42,6 @@ class TransformerConfig:
     position_encoding: bool = True
     attention_groups: int = None # grouped-query attention
     attention_window: int = None
-    sparse_attention: bool = None # requires attention_window
     layer_norm: str = 'LayerNorm' # 'RMSNorm'
 
     def padded_vocab_size(self):
@@ -123,9 +122,7 @@ class Transformer(Model):
         if c.position_encoding:
             self.position_encoding = nn.Parameter(torch.randn(c.context_size, c.d_model))
 
-        self.blocks = nn.ModuleList([TransformerBlock(
-            c.copy(sparse_attention=(l%2) and c.sparse_attention)
-            ) for l in range(c.n_layers)])
+        self.blocks = nn.ModuleList([TransformerBlock(c) for l in range(c.n_layers)])
 
         self.logits = Logits(c, self.token_embedding if c.tie_embedding else None)
 
@@ -279,7 +276,6 @@ class SelfAttention(nn.Module):
         self.d_key = config.d_key
         self.init = config.init
         self.attention_window = config.attention_window
-        self.sparse_attention = config.sparse_attention
         self.context_size = config.context_size
         assert self.attention_window is None or self.attention_window > 0
         n_head = int_div(d, self.d_key)
@@ -314,11 +310,6 @@ class SelfAttention(nn.Module):
         return T*(4*d*d + 2*d*W)
 
     def forward(self, x, *, log, cache=None, cache_seqlen=None):
-        if self.sparse_attention:
-            B, Tx, d = x.shape
-            W = self.attention_window
-            x = x.view(B, Tx//W, W, d).transpose(1, 2).reshape(B*W, Tx//W, d)
-
         B, Tx, d = x.shape
         d_k = self.d_key
         n_h = d // d_k
@@ -371,21 +362,20 @@ class SelfAttention(nn.Module):
                 cache_KV[1, :, t:t+Tx] = V
                 K, V = cache_KV[:, :, :t+Tx]
 
-        attention_window = None if self.sparse_attention else self.attention_window
         if flash_attn is not None and Q.device.type == 'cuda':
-            window_size = (-1,-1) if attention_window is None else (attention_window-1, 0)
+            window_size = (-1,-1) if self.attention_window is None else (self.attention_window-1, 0)
             x = flash_attn.flash_attn_func(Q, K, V, causal=True, window_size=window_size) # (B, T, n_h, d_k)
         else:
             assert Q.device.type != 'cuda' or Tx > 1 # else significant performance loss
             Tk = K.shape[1]
 
             mask = None
-            if cache is not None or attention_window is not None:
+            if cache is not None or self.attention_window is not None:
                 q_ts = torch.arange(t, t+Tx, **like(Q))[:,None]
                 k_ts = torch.arange(Tk, **like(Q))
                 mask = q_ts >= k_ts
-                if attention_window is not None:
-                    mask &= q_ts - k_ts <= attention_window
+                if self.attention_window is not None:
+                    mask &= q_ts - k_ts <= self.attention_window
 
             Q = Q.transpose(1, 2)
             K = K.transpose(1, 2)
@@ -402,13 +392,6 @@ class SelfAttention(nn.Module):
 
         x = x.view(B, Tx, d)
         x = self.linear(x, log=log)
-
-        if self.sparse_attention:
-            BW, Tx_W, d = x.shape
-            B = BW // W
-            Tx = Tx_W * W
-            W = self.attention_window
-            x = x.view(B, W, Tx//W, d).transpose(1, 2).reshape(B, Tx, d)
 
         return x
 
