@@ -1,7 +1,7 @@
 import copy
 import math
 from dataclasses import dataclass
-from typing import Optional  # We only need Optional for entropy_threshold
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -48,18 +48,11 @@ class TransformerConfig:
 
     def padded_vocab_size(self):
         d = 64
-        if self.vocab_size is None:
-            raise ValueError("vocab_size must be set before calling padded_vocab_size")
+        assert self.vocab_size is not None, "vocab_size must be set"
         return util.ceil(self.vocab_size, d)
 
     def __post_init__(self):
         d = self.d_model
-
-        # Required fields
-        if self.vocab_size is None:
-            raise ValueError("vocab_size must be set")
-
-        # Optional fields with defaults
         if self.context_size is None:
             self.context_size = d
 
@@ -151,6 +144,8 @@ class Transformer(Model):
 
     def n_mult_add(self):
         c = self.config
+        assert c.context_size is not None, "context_size must be set"
+        assert c.vocab_size is not None, "vocab_size must be set"
         T = c.context_size
         d = c.d_model
         V = c.vocab_size
@@ -188,6 +183,7 @@ class Transformer(Model):
 
     def generate(self, tokens, *, max_tokens=None, temperature=1.0, top_k=None, input_lengths=None,
                  logits=False, use_cache=True, check_logits_func=None):
+        assert self.config.context_size is not None, "context_size must be set"
         if max_tokens is None:
             max_tokens = self.config.context_size + 1
         else:

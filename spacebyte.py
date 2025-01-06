@@ -15,65 +15,37 @@ class SpaceByteConfig(TransformerConfig):
     global_context_size: Optional[int] = None
 
     d_local: Optional[int] = None
-    n_initial_layers: Optional[int] = None # number of layers for the first local model
-    n_local_layers: Optional[int] = None # total number of layers for both local models
+    n_initial_layers: Optional[int] = None  # number of layers for the first local model
+    n_local_layers: Optional[int] = None  # total number of layers for both local models
     local_attention_window: Optional[int] = None
+
+    entropy_threshold: Optional[float] = None  # When None, use default global block behavior
 
     print_patches: float = 0 # fraction of time to print the patches
 
     def __post_init__(self):
-        c = self
-
-        # First ensure required fields are set
-        if c.d_model is None:
-            raise ValueError("d_model must be set")
-
-        # Set n_layers first since other values depend on it
+        # Set simple defaults
         if self.n_layers is None:
-            # half of the Transformer default
-            self.n_layers = round(max(4, 12.49*math.log2(c.d_model/154.3)) / 2)
+            self.n_layers = round(max(4, 12.49*math.log2(self.d_model/154.3)) / 2)
+        if self.d_local is None:
+            self.d_local = self.d_model // 2
+        if self.n_local_layers is None:
+            self.n_local_layers = self.n_layers
+        if self.n_initial_layers is None and self.n_local_layers is not None:
+            self.n_initial_layers = self.n_local_layers // 2
+        if self.local_attention_window is None:
+            self.local_attention_window = self.d_local
 
-        # Set context sizes with proper dependencies
-        default_patch_size: int = 6
-        if c.global_context_size is None and c.context_size is not None:
-            c.global_context_size = c.context_size // default_patch_size
-        elif c.global_context_size is None:
-            c.global_context_size = self.d_model
-
-        if c.context_size is None and c.global_context_size is not None:
-            c.context_size = default_patch_size * c.global_context_size
-        elif c.context_size is None:
-            c.context_size = self.d_model * default_patch_size
-
-        if c.patch_method == 'periodic':
-            if c.context_size is None or c.global_context_size is None:
-                raise ValueError("context_size and global_context_size must be set for periodic patch method")
-            assert c.context_size % c.global_context_size == 0
+        # Handle context sizes
+        default_patch_size = 6
+        if self.global_context_size is None and self.context_size is not None:
+            self.global_context_size = self.context_size // default_patch_size
+        elif self.global_context_size is None:
+            self.global_context_size = self.d_model
+        if self.context_size is None and self.global_context_size is not None:
+            self.context_size = default_patch_size * self.global_context_size
 
         super().__post_init__()
-
-        assert c.tokenizer is None
-
-        # Set dependent values after parent initialization
-        if c.d_local is None:
-            c.d_local = c.d_model // 2
-
-        if c.n_local_layers is None and self.n_layers is not None:
-            c.n_local_layers = self.n_layers
-
-        if c.n_initial_layers is None and c.n_local_layers is not None:
-            c.n_initial_layers = c.n_local_layers // 2
-
-        if c.local_attention_window is None and c.d_local is not None:
-            c.local_attention_window = c.d_local
-
-        # Final validation of required fields
-        required_fields = ['d_model', 'context_size', 'global_context_size', 
-                         'n_layers', 'n_local_layers', 'n_initial_layers',
-                         'd_local', 'local_attention_window']
-        for field in required_fields:
-            if getattr(self, field) is None:
-                raise ValueError(f"{field} must be set or have a valid default")
 
 class SpaceByte(Model):
     Config = SpaceByteConfig
@@ -83,28 +55,26 @@ class SpaceByte(Model):
         self.config = config
         c = self.config
 
-        # Validate required config values
-        required_fields = ['vocab_size', 'd_local', 'context_size', 'global_context_size', 
-                         'n_layers', 'n_local_layers', 'n_initial_layers']
-        for field in required_fields:
-            if getattr(c, field) is None:
-                raise ValueError(f"{field} must be set before initializing SpaceByte")
+        # Essential assertions for initialization
+        assert c.position_encoding, "position_encoding must be True"
+        assert c.vocab_size is not None, "vocab_size must be set"
+        assert c.d_local is not None, "d_local must be set"
+        assert c.d_model is not None, "d_model must be set"
 
         self.token_embedding = nn.Embedding(
             c.padded_vocab_size() if c.tie_embedding else c.vocab_size, c.d_local)
-        assert c.position_encoding # else not implemented
         self.local_position_encoding = nn.Parameter(torch.randn(c.context_size, c.d_local))
 
         local_config = c.copy(d_model=c.d_local, attention_window=c.local_attention_window)
-        self.initial_blocks = nn.ModuleList([TransformerBlock(local_config) for _ in range(c.n_initial_layers)])
+        self.initial_blocks = nn.ModuleList([TransformerBlock(local_config) for _ in range(c.n_initial_layers or 0)])
 
         self.global_position_encoding = nn.Parameter(torch.randn(c.global_context_size, c.d_model))
 
         global_config = c.copy(context_size=c.global_context_size)
-        self.global_blocks = nn.ModuleList([TransformerBlock(global_config) for l in range(c.n_layers)])
+        self.global_blocks = nn.ModuleList([TransformerBlock(global_config) for l in range(c.n_layers or 0)])
 
         self.final_blocks = nn.ModuleList([
-            TransformerBlock(local_config) for _ in range(c.n_initial_layers, c.n_local_layers) ])
+            TransformerBlock(local_config) for _ in range(c.n_initial_layers or 0, c.n_local_layers or 0) ])
         self.logits = Logits(local_config, self.token_embedding if c.tie_embedding else None)
 
         super().__post_init__()
@@ -127,8 +97,10 @@ class SpaceByte(Model):
 
     def n_mult_add(self, training=False):
         c = self.config
-        if any(v is None for v in [c.context_size, c.global_context_size, c.d_local, c.vocab_size]):
-            raise ValueError("All dimensions must be set for n_mult_add calculation")
+        assert c.context_size is not None, "context_size must be set"
+        assert c.global_context_size is not None, "global_context_size must be set"
+        assert c.d_local is not None, "d_local must be set"
+        assert c.vocab_size is not None, "vocab_size must be set"
         
         TL = c.context_size
         TG = c.global_context_size
@@ -142,6 +114,9 @@ class SpaceByte(Model):
 
     def forward(self, tokens, targets=None, *, log=None):
         c = self.config
+        assert c.n_initial_layers is not None, "n_initial_layers must be set"
+        assert c.context_size is not None, "context_size must be set"
+        assert c.global_context_size is not None, "global_context_size must be set"
 
         x = self.token_embedding(tokens)
         B, Tx, d = x.shape
@@ -152,7 +127,7 @@ class SpaceByte(Model):
         # Calculate entropy after first sequence of local blocks
         partial_logits = None
         entropy = None
-        first_sequence_end = c.n_initial_layers // 2 - 1
+        first_sequence_end = c.n_initial_layers // 2 - 1 if c.n_initial_layers > 1 else 0
         use_global_blocks = True  # Default to using global blocks
         
         for i, block in enumerate(self.initial_blocks):
@@ -172,9 +147,11 @@ class SpaceByte(Model):
                     if log is not None:
                         log['used_global_blocks'] = use_global_blocks
 
+        assert c.d_model is not None, "d_model must be set"
         D = c.d_model
-        T = c.context_size
-        TG = c.global_context_size
+        T = c.context_size  # Already asserted at start of forward()
+        TG = c.global_context_size  # Already asserted at start of forward()
+        assert T > 0 and TG > 0, "context sizes must be positive"
         P = T // TG
         if c.patch_method != 'periodic':
             global_T = torch.full((B,), -1)
