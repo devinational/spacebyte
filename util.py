@@ -4,6 +4,7 @@ import sys
 import contextlib
 # import resource
 import dataclasses
+from typing import get_origin, get_args, Union, Optional
 # import math
 # from collections.abc import Iterable
 
@@ -19,21 +20,75 @@ import sentencepiece as spm
 # https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#requirements-tc
 DIM_MULT = 64
 
-def interactive_mode():
+def interactive_mode() -> bool:
+    """Check if Python is running in interactive mode.
+    
+    Returns:
+        bool: True if running in interactive mode (e.g., Python REPL),
+              False if running as a script.
+    """
     return hasattr(sys, 'ps1')
 
-def notNone(x):
+def notNone(x: object) -> bool | None:
+    """Check if a value is not None and return a boolean indicator.
+    
+    Args:
+        x: Any Python object to check for None-ness
+        
+    Returns:
+        bool | None: True if x is not None, None otherwise
+    """
     return True if x is not None else None
 
-def chrs(ts):
-    def chr_(t):
+def chrs(ts: list[int] | tuple[int, ...]) -> str:
+    """Convert a sequence of integer values to a string, replacing non-printable characters.
+    
+    Args:
+        ts: A sequence of integer values representing character codes
+        
+    Returns:
+        str: A string where each character corresponds to an input integer,
+             with non-printable characters replaced by '¤' (character 164)
+    """
+    def chr_(t: int) -> str:
+        """Convert a single integer to a character, replacing non-printable ones.
+        
+        Args:
+            t: Integer value representing a character code
+            
+        Returns:
+            str: The character if it's printable (ASCII 32-126 or 161+, except 173),
+                 or '¤' (character 164) for non-printable characters
+        """
         return chr(t if 32 <= t <= 126 or (161 <= t and t != 173) else 164) #  or (128 <= t <= 130)
     return ''.join(chr_(t) for t in ts)
 
-def mean2(x: torch.Tensor):
+def mean2(x: torch.Tensor) -> torch.Tensor:
+    """Calculate the root mean square (RMS) value of a tensor.
+    
+    Computes sqrt(mean(x²)) for the input tensor, which is useful for
+    calculating the RMS (quadratic mean) of values in machine learning contexts.
+    
+    Args:
+        x: Input tensor of any shape
+        
+    Returns:
+        torch.Tensor: A scalar tensor containing the RMS value
+    """
     return (x*x).mean().sqrt()
 
-def norm2(x: torch.Tensor):
+def norm2(x: torch.Tensor) -> torch.Tensor:
+    """Calculate the squared L2 norm (dot product) of a tensor with itself.
+    
+    Computes the sum of squared elements in the tensor by flattening it and
+    computing the dot product with itself: sum(x_i²) for all elements x_i.
+    
+    Args:
+        x: Input tensor of any shape
+        
+    Returns:
+        torch.Tensor: A scalar tensor containing the squared L2 norm
+    """
     return torch.dot(x.flatten(), x.flatten())
 
 def ceil_div(n: int, k: int) -> int:
@@ -205,10 +260,43 @@ def empty_cache(device):
     elif device_is('mps'):
         torch.mps.empty_cache()
 
+from typing import Optional, get_origin, get_args
+
 def make_dataclasses(data_classes, **kwargs):
     field_typess = [ {field.name : field.type for field in dataclasses.fields(data_class)}
         for data_class in data_classes ]
     dicts = [{} for _ in data_classes]
+
+    def convert_value(value, field_type):
+        if value is None:
+            return None
+            
+        origin = get_origin(field_type)
+        if origin is Union:
+            types = get_args(field_type)
+            # Handle Optional[T] which is Union[T, None]
+            if type(None) in types and len(types) == 2:
+                actual_type = next(t for t in types if t is not type(None))
+                return convert_value(value, actual_type)
+            # Try each possible type until one works
+            for t in types:
+                try:
+                    return convert_value(value, t)
+                except (ValueError, TypeError):
+                    continue
+            raise ValueError(f"Could not convert {value} to any of {types}")
+        elif origin is not None:
+            # Handle other generic types (List, Dict, etc)
+            args = get_args(field_type)
+            if origin is list:
+                return [convert_value(v, args[0]) for v in value]
+            elif origin is dict:
+                return {k: convert_value(v, args[1]) for k, v in value.items()}
+            # Add other container types as needed
+            return value
+        else:
+            # Basic type conversion
+            return field_type(value)
 
     for k, v in kwargs.items():
         used = False
@@ -217,8 +305,10 @@ def make_dataclasses(data_classes, **kwargs):
             if field_type is not None:
                 assert not used
                 used = True
-                if v is not None:
-                    dict0[k] = field_type(v)
+                try:
+                    dict0[k] = convert_value(v, field_type)
+                except Exception as e:
+                    raise ValueError(f"Failed to convert {k}={v} to {field_type}: {str(e)}")
         
         if not used:
             raise Exception(f'make_dataclasses: {k} not found in {data_classes}')

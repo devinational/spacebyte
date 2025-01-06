@@ -1,7 +1,7 @@
 import copy
 import math
 from dataclasses import dataclass
-# from typing import Union
+from typing import Optional  # We only need Optional for entropy_threshold
 
 import torch
 import torch.nn as nn
@@ -20,16 +20,16 @@ from util import log_forward, num_params, notNone, like, int_div
 
 @dataclass
 class TransformerConfig:
-    vocab_size: int = None
-    BOS: int = None
+    vocab_size: Optional[int] = None
+    BOS: Optional[int] = None
 
-    tokenizer: str = None
+    tokenizer: Optional[str] = None
     d_model: int = 256
-    context_size: int = None
+    context_size: Optional[int] = None
     d_key: int = 64
     d_ff_mult: int = 4
-    n_layers: int = None
-    tie_embedding: bool = None
+    n_layers: Optional[int] = None
+    tie_embedding: Optional[bool] = None
 
     # "Small-scale proxies for large-scale Transformer training instabilities"
     qk_layer_norm: bool = True
@@ -40,18 +40,26 @@ class TransformerConfig:
     nonlinear: str = 'ReLU' # ReLU, GELU
     rope: bool = False
     position_encoding: bool = True
-    attention_groups: int = None # grouped-query attention
-    attention_window: int = None
-    sparse_attention: bool = None # requires attention_window
+    attention_groups: Optional[int] = None # grouped-query attention
+    attention_window: Optional[int] = None
+    sparse_attention: Optional[bool] = None # requires attention_window
     layer_norm: str = 'LayerNorm' # 'RMSNorm'
+    entropy_threshold: Optional[float] = None  # threshold above which global blocks are used
 
     def padded_vocab_size(self):
         d = 64
+        if self.vocab_size is None:
+            raise ValueError("vocab_size must be set before calling padded_vocab_size")
         return util.ceil(self.vocab_size, d)
 
     def __post_init__(self):
         d = self.d_model
 
+        # Required fields
+        if self.vocab_size is None:
+            raise ValueError("vocab_size must be set")
+
+        # Optional fields with defaults
         if self.context_size is None:
             self.context_size = d
 
